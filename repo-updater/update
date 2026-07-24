@@ -1,0 +1,273 @@
+#!/bin/bash
+# Enhanced Multi-Branch Repository Update Script
+# Color Definitions
+GREEN="\033[32m"
+YELLOW="\033[33m"
+RED="\033[31m"
+BLUE="\033[34m"
+MAGENTA="\033[35m"
+BOLD="\033[1m"
+RESET="\033[0m"
+
+# Load configuration from the current directory
+CONFIG_FILE="./update.conf"
+
+if [ -f "$CONFIG_FILE" ]; then
+    source "$CONFIG_FILE"
+else
+    echo -e "${RED}✗ Error: Configuration file not found at ${CONFIG_FILE}${RESET}"
+    echo -e "${YELLOW}Please create update.conf in the same directory.${RESET}"
+    exit 1
+fi
+
+# GitHub SSH URL template (uses GITHUB_USERNAME from config)
+SSH_URL_BASE="git@github.com:${GITHUB_USERNAME}"
+
+# Statistics tracking
+declare -A repo_stats
+total_updated=0
+total_errors=0
+total_uptodate=0
+
+echo -e "${BOLD}🚀 Starting comprehensive repository updates...${RESET}"
+if [ "$UPDATE_MODE" = "all" ]; then
+    echo -e "${BLUE}📋 Mode: Updating ALL remote branches (excluding: ${EXCLUDE_BRANCHES[*]})${RESET}"
+else
+    echo -e "${BLUE}📋 Mode: Updating specified branches: ${SPECIFIED_BRANCHES[*]}${RESET}"
+fi
+
+for repo in "${REPOS[@]}"; do
+    echo -e "\n${BOLD}${MAGENTA}🔍 Processing ${repo}...${RESET}"
+    
+    # Debug: Show current directory and what we're looking for
+    echo -e "${YELLOW}→ Current directory: $(pwd)${RESET}"
+    echo -e "${YELLOW}→ Looking for directory: ${repo}${RESET}"
+    
+    # Check if directory exists
+    if [ ! -d "$repo" ]; then
+        echo -e "${RED}✗ Error: ${repo} directory not found!${RESET}"
+        echo -e "${YELLOW}→ Available directories: $(ls -la | grep ^d | awk '{print $9}' | grep -v '^\.$\|^\.\.$' | tr '\n' ' ')${RESET}"
+        ((total_errors++))
+        continue
+    fi
+    
+    pushd "$repo" > /dev/null || { echo -e "${RED}✗ Failed to enter ${repo}!${RESET}"; ((total_errors++)); continue; }
+    
+    # Check for uncommitted changes
+    if ! git diff-index --quiet HEAD -- 2>/dev/null; then
+        echo -e "${YELLOW}⚠️  You have uncommitted changes in ${repo}.${RESET}"
+        read -p "Do you want to discard these unsaved changes? (y/N) " -n 1 -r < /dev/tty
+        echo
+        if [[ $REPLY =~ ^[Yy]$ ]]; then
+            echo -e "${YELLOW}→ Discarding changes...${RESET}"
+            git reset --hard HEAD
+            git clean -fd
+            echo -e "${GREEN}✓ Changes discarded.${RESET}"
+        else
+            echo -e "${RED}✗ Skipping ${repo} to protect your work.${RESET}"
+            popd > /dev/null
+            repo_stats["$repo"]="SKIPPED (Uncommitted changes)"
+            continue
+        fi
+    fi
+
+    # Store original branch to return to later
+    original_branch=$(git rev-parse --abbrev-ref HEAD 2>/dev/null)
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}✗ Not a git repository: ${repo}${RESET}"
+        popd > /dev/null
+        ((total_errors++))
+        continue
+    fi
+    
+    # Ensure SSH remote - FIX: Handle subdirectory paths correctly
+    current_url=$(git remote get-url origin 2>/dev/null)
+    if [[ "$current_url" != git@github.com:* ]]; then
+        echo -e "${YELLOW}→ Switching origin to SSH (${repo})…${RESET}"
+        # Extract just the repo name from the path for SSH URL
+        repo_name=$(basename "$repo")
+        git remote set-url origin "${SSH_URL_BASE}/${repo_name}.git"
+    fi
+    
+    # Debug: show remote URL
+    remote_url=$(git remote get-url origin)
+    echo -e "${YELLOW}→ Using remote URL: ${remote_url}${RESET}"
+    
+    # Fetch all updates (including new branches and all commits from other devs)
+    echo -e "${BLUE}→ Fetching all updates and commits from origin...${RESET}"
+    if ! fetch_out=$(git fetch --all --prune 2>&1); then
+        echo -e "${RED}✗ Failed to fetch updates for ${repo}!${RESET}"
+        echo -e "${YELLOW}Debug: Git fetch error message:${RESET}"
+        echo "$fetch_out"
+        popd > /dev/null
+        ((total_errors++))
+        continue
+    fi
+    
+    # Get list of all remote branches
+    echo -e "${BLUE}→ Discovering available remote branches...${RESET}"
+    remote_branches=$(git for-each-ref --format='%(refname:short)' refs/remotes/origin | grep -v "origin/HEAD" | sed 's/origin\///')
+    
+    # DEBUG: Show what branches were found
+    echo -e "${YELLOW}→ Remote branches found: ${RESET}"
+    echo "$remote_branches" | while read -r branch; do
+        [ -n "$branch" ] && echo -e "    ${branch}"
+    done
+    
+    # Determine which branches to update
+    if [ "$UPDATE_MODE" = "all" ]; then
+        # Use all remote branches except excluded ones
+        branches_to_process=()
+        while IFS= read -r branch; do
+            # Skip empty lines
+            [ -z "$branch" ] && continue
+            
+            # Check if branch should be excluded
+            excluded=false
+            for exclude in "${EXCLUDE_BRANCHES[@]}"; do
+                if [[ "$branch" == *"$exclude"* ]]; then
+                    excluded=true
+                    break
+                fi
+            done
+            
+            if [ "$excluded" = false ]; then
+                branches_to_process+=("$branch")
+            else
+                echo -e "  ${YELLOW}⚠️  Excluding branch: ${branch}${RESET}"
+            fi
+        done <<< "$remote_branches"
+        
+        echo -e "${GREEN}✓ Found ${#branches_to_process[@]} branches to update${RESET}"
+    else
+        # Use specified branches only - but filter to only those that exist
+        branches_to_process=()
+        for branch in "${SPECIFIED_BRANCHES[@]}"; do
+            if echo "$remote_branches" | grep -q "^${branch}$"; then
+                branches_to_process+=("$branch")
+            else
+                echo -e "  ${YELLOW}⚠️  Specified branch '${branch}' doesn't exist on remote, skipping...${RESET}"
+            fi
+        done
+        echo -e "${GREEN}✓ Using ${#branches_to_process[@]} available specified branches${RESET}"
+    fi
+    
+    # IMPROVEMENT: Handle case where no branches to process
+    if [ ${#branches_to_process[@]} -eq 0 ]; then
+        echo -e "${YELLOW}⚠️  No branches to process for ${repo}${RESET}"
+        popd > /dev/null
+        repo_stats["$repo"]="NO_BRANCHES"
+        continue
+    fi
+    
+    repo_updated=false
+    repo_errors=false
+    
+    # Process each branch we want to update
+    for branch in "${branches_to_process[@]}"; do
+        echo -e "\n  ${BOLD}🌿 Processing branch: ${branch}${RESET}"
+        
+        # Check if branch exists locally
+        if git show-ref --verify --quiet refs/heads/"$branch"; then
+            # Branch exists locally
+            echo -e "  ${BLUE}→ Switching to existing local branch '${branch}'...${RESET}"
+            if ! git checkout "$branch" 2>/dev/null; then
+                echo -e "  ${RED}✗ Failed to checkout branch '${branch}'${RESET}"
+                repo_errors=true
+                continue
+            fi
+        else
+            # Branch doesn't exist locally, create it
+            echo -e "  ${BLUE}→ Creating new local branch '${branch}' from origin/${branch}...${RESET}"
+            if ! git checkout -b "$branch" "origin/$branch" 2>/dev/null; then
+                echo -e "  ${RED}✗ Failed to create branch '${branch}'${RESET}"
+                repo_errors=true
+                continue
+            fi
+            echo -e "  ${GREEN}✅ Created new branch '${branch}'${RESET}"
+            repo_updated=true
+            continue
+        fi
+        
+        # Check ahead/behind counts: "<behind> <ahead>"
+        if ! counts=$(git rev-list --left-right --count origin/"$branch"...HEAD 2>/dev/null); then
+            echo -e "  ${RED}✗ Failed to compare branch '${branch}' with remote${RESET}"
+            repo_errors=true
+            continue
+        fi
+        
+        behind=$(echo "$counts" | awk '{print $1}')
+        ahead=$(echo "$counts" | awk '{print $2}')
+        
+        # If local is ahead, warn and skip pull
+        if [ "$ahead" -gt 0 ]; then
+            echo -e "  ${RED}⚠️  Branch '${branch}' is ${ahead} commit(s) ahead of origin. Skipping pull to avoid conflicts.${RESET}"
+            echo -e "  ${YELLOW}    Consider pushing your changes or creating a backup branch.${RESET}"
+            continue
+        fi
+        
+        # If branch is behind, pull
+        if [ "$behind" -gt 0 ]; then
+            echo -e "  ${YELLOW}⭳ Pulling ${behind} commit(s) for branch '${branch}'...${RESET}"
+            if git pull --ff-only origin "$branch" 2>/dev/null; then
+                echo -e "  ${GREEN}✅ Branch '${branch}' updated successfully!${RESET}"
+                repo_updated=true
+            else
+                echo -e "  ${RED}✗ Failed to pull updates for branch '${branch}'${RESET}"
+                echo -e "  ${YELLOW}    This might be due to merge conflicts or diverged history.${RESET}"
+                repo_errors=true
+            fi
+        else
+            echo -e "  ${GREEN}✓ Branch '${branch}' is already up-to-date.${RESET}"
+        fi
+    done
+    
+    # Return to original branch
+    if [ "$original_branch" != "HEAD" ] && [ -n "$original_branch" ]; then
+        echo -e "\n  ${BLUE}→ Returning to original branch '${original_branch}'...${RESET}"
+        git checkout "$original_branch" 2>/dev/null || echo -e "  ${YELLOW}⚠️  Could not return to original branch${RESET}"
+    fi
+    
+    # Update statistics
+    if [ "$repo_updated" = true ]; then
+        ((total_updated++))
+        repo_stats["$repo"]="UPDATED"
+    elif [ "$repo_errors" = true ]; then
+        ((total_errors++))
+        repo_stats["$repo"]="ERRORS"
+    else
+        ((total_uptodate++))
+        repo_stats["$repo"]="UP-TO-DATE"
+    fi
+    
+    popd > /dev/null  # Go back to original directory
+done
+
+# Final Summary
+echo -e "\n${BOLD}📊 Final Update Summary:${RESET}"
+echo -e "${GREEN}✓ Updated: ${total_updated}${RESET} | ${BLUE}✓ Up-to-date: ${total_uptodate}${RESET} | ${RED}✗ Errors: ${total_errors}${RESET}"
+
+echo -e "\n${BOLD}📋 Repository Status:${RESET}"
+for repo in "${REPOS[@]}"; do
+    status="${repo_stats[$repo]:-SKIPPED}"
+    case "$status" in
+        "UPDATED")
+            echo -e "  ${GREEN}✅ ${repo}: Updated${RESET}"
+            ;;
+        "UP-TO-DATE")
+            echo -e "  ${BLUE}✓ ${repo}: Up-to-date${RESET}"
+            ;;
+        "ERRORS")
+            echo -e "  ${RED}✗ ${repo}: Had errors${RESET}"
+            ;;
+        "NO_BRANCHES")
+            echo -e "  ${YELLOW}⚠️  ${repo}: No branches to process${RESET}"
+            ;;
+        *)
+            echo -e "  ${YELLOW}⚠️  ${repo}: Skipped${RESET}"
+            ;;
+    esac
+done
+
+echo -e "\n${BOLD}✅ All repositories processed.${RESET}"
+echo -e "${MAGENTA}💡 Tip: Use 'git log --oneline -10' in each repo to see recent commits from all developers.${RESET}"
