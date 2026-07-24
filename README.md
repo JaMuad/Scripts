@@ -21,7 +21,27 @@ ln -s ~/project/Scripts/repo-updater/update ~/.local/bin/update
 chmod +x ~/project/Scripts/repo-updater/update
 ```
 
-*(Note: Ensure that `~/.local/bin` is added to your system's `PATH` variable in your `.bashrc` or `.zshrc`)*
+### Setting up your PATH
+
+If you've never used `~/.local/bin/` before, your terminal needs to know to look there for commands.
+
+For **Zsh** (most common):
+1. Open your zsh config file in your terminal: 
+   ```bash
+   nano ~/.zshrc
+   ```
+2. Scroll to the very bottom of the file and paste this exact line:
+   ```bash
+   export PATH="$HOME/.local/bin:$PATH"
+   ```
+3. Save the file (if using nano, press `Ctrl+O`, then `Enter`, then `Ctrl+X` to exit).
+4. Reload your terminal so the changes take effect immediately:
+   ```bash
+   source ~/.zshrc
+   ```
+
+For **Bash**:
+*(Follow the exact same steps, but use `~/.bashrc` instead).*
 
 ## Best Practices
 - **Do not commit actual `.conf` files.** Always use `.conf-example` templates and keep your local, personal configurations excluded from Git.
