@@ -14,9 +14,16 @@ CONFIG_FILE="./update.conf"
 
 if [ -f "$CONFIG_FILE" ]; then
     source "$CONFIG_FILE"
+    
+    # Validate required configuration variables
+    if [ -z "$GITHUB_USERNAME" ] || [ ${#REPOS[@]} -eq 0 ] || [ "$GITHUB_USERNAME" = "YourUsernameHere" ]; then
+        echo -e "${RED}✗ Error: Configuration file is missing required variables or still has placeholder values!${RESET}"
+        echo -e "${YELLOW}Please ensure GITHUB_USERNAME and REPOS are properly set in update.conf.${RESET}"
+        exit 1
+    fi
 else
     echo -e "${RED}✗ Error: Configuration file not found at ${CONFIG_FILE}${RESET}"
-    echo -e "${YELLOW}Please create update.conf in the same directory.${RESET}"
+    echo -e "${YELLOW}Please create update.conf in the same directory where you are running the command.${RESET}"
     exit 1
 fi
 

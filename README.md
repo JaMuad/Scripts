@@ -40,6 +40,14 @@ For **Zsh** (most common):
    source ~/.zshrc
    ```
 
+### Executing your scripts
+Once your PATH is set up and the script is symlinked, you can execute it from **any folder** simply by typing its name! 
+
+For example, to run the repo updater, just type:
+```bash
+update
+```
+
 For **Bash**:
 *(Follow the exact same steps, but use `~/.bashrc` instead).*
 
