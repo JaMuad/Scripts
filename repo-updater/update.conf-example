@@ -1,0 +1,21 @@
+# Configuration file for the 'update' script
+# Copy this file to 'update.conf' in your project directory and edit the values.
+
+# Your GitHub username or organization name.
+# This keeps the script generic so it doesn't expose your username in the source code!
+# (e.g., GITHUB_USERNAME="YourUsername")
+GITHUB_USERNAME="YourUsernameHere"
+
+# Repositories to update.
+# Add or remove repository directory names here. These should match the folder names on your local machine.
+# (e.g., REPOS=("Project-A" "Project-B"))
+REPOS=("Example-Backend" "Example-Frontend")
+
+# Branch update mode - set to "all" to update ALL remote branches, or "specified" for custom list
+UPDATE_MODE="all"  # Change to "specified" if you want to use the custom list below
+
+# Custom branches to update (only used if UPDATE_MODE="specified")
+SPECIFIED_BRANCHES=("main" "dev" "staging" "production")
+
+# Branches to exclude from updates (even in "all" mode)
+EXCLUDE_BRANCHES=("temp" "experimental" "backup")
