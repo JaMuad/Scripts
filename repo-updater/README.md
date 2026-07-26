@@ -40,3 +40,8 @@ If the script fails to run or behaves unexpectedly, check the following common m
 - **Execution Permissions:** Make sure the script is executable. If it's not, run `chmod +x ~/.local/bin/update` (or point to the original file in the Scripts repo).
 - **PATH Issues:** If your terminal says `command not found: update`, make sure `~/.local/bin` is added to your `PATH`. Verify whether you are using Bash (`~/.bashrc`) or Zsh (`~/.zshrc`) and that the export line was added correctly.
 - **Typographical Errors:** Double-check the spelling of your folders in the `REPOS` array inside `update.conf`. They must exactly match the folder names on your local machine.
+- **Broken Symlinks (Moving the Project):** Symlinks (created via `ln -s`) use exact paths. If you move this project folder to a different location (for example, from your home directory `~/` to `~/Documents/`), the symlink will break and your command will output `command not found`. To fix this, delete the broken link and create a new one pointing to the new location:
+  ```bash
+  rm ~/.local/bin/update
+  ln -s ~/Documents/repo-updater/update ~/.local/bin/update
+  ```

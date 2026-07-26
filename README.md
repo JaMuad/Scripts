@@ -21,6 +21,14 @@ ln -s ~/project/Scripts/repo-updater/update ~/.local/bin/update
 chmod +x ~/project/Scripts/repo-updater/update
 ```
 
+> [!WARNING]
+> **Broken Symlinks (Moving the Project)**
+> Symlinks use absolute, exact paths. If you ever move this repository to a different folder (e.g. from `~/project/` to `~/Documents/`), the symlink will break and your commands will stop working (outputting a `command not found` error). If this happens, simply delete the old link and recreate it pointing to the new location:
+> ```bash
+> rm ~/.local/bin/update
+> ln -s ~/Documents/Scripts/repo-updater/update ~/.local/bin/update
+> ```
+
 ### Setting up your PATH
 
 If you've never used `~/.local/bin/` before, your terminal needs to know to look there for commands.
