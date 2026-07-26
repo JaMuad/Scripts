@@ -2,6 +2,13 @@
 
 This repository contains all of my personal automation scripts and tools.
 
+## Available Scripts
+
+| Script Folder | Global Command | Description |
+|---|---|---|
+| [📁 repo-updater](./repo-updater/) | `update` | Automatically loops through multiple local repositories and fast-forwards all active branches. |
+| *📁 (More Coming Soon...)* | | |
+
 ## Installation Strategy
 
 I store all of my scripts in this central repository and execute them globally by symlinking them to my `~/.local/bin/` directory.
