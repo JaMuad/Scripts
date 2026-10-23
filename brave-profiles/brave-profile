@@ -1,0 +1,354 @@
+#!/usr/bin/env bash
+# brave-profile — create and manage fully isolated Brave profiles, one at a time.
+# Part of https://github.com/JaMuad/Scripts (brave-profiles)
+#
+#   brave-profile            create a new profile (asks you questions step by step)
+#   brave-profile list       show all your profiles
+#   brave-profile remove     remove a profile (asks which one)
+#
+# Each profile gets its OWN data folder (--user-data-dir): own logins, cookies,
+# history, cache, extensions and DNS setting, plus its own launcher and dock icon.
+
+set -uo pipefail   # no "set -e": this script checks and reports every step itself
+
+PROFILES_DIR="$HOME/.config/brave-profiles"
+APPS_DIR="$HOME/.local/share/applications"
+# Path this script was run from, WITHOUT resolving symlinks, so launchers keep
+# working through ~/.local/bin/brave-profile even if the repo is moved later.
+SELF="$(realpath -s "${BASH_SOURCE[0]}")"
+COMMON_FLAGS=(--no-first-run --no-default-browser-check)
+EPHEMERAL_CACHE_LIMIT=268435456   # 256 MB cache cap for wipe-on-close profiles
+DOH_TEST_QUERY="AAABAAABAAAAAAAAA3d3dwdleGFtcGxlA2NvbQAAAQAB"   # DNS question: www.example.com
+
+# ---------- output helpers ----------
+if [[ -t 1 ]]; then G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; B=$'\e[1;34m'; D=$'\e[2m'; N=$'\e[0m'
+else G=""; R=""; Y=""; B=""; D=""; N=""; fi
+ok()   { printf '  %s✔%s %s\n' "$G" "$N" "$*"; }
+bad()  { printf '  %s✘%s %s\n' "$R" "$N" "$*"; }
+warn() { printf '  %s⚠%s %s\n' "$Y" "$N" "$*"; }
+step() { printf '\n%s▸ %s%s\n' "$B" "$*" "$N"; }
+die()  { bad "$*"; exit 1; }
+
+# ask "Question: " VAR  — reads a line; Ctrl+D cancels cleanly
+ask() {
+  local _reply
+  if ! read -r -p "  $1" _reply; then echo; die "Cancelled. Nothing was changed."; fi
+  printf -v "$2" '%s' "$_reply"
+}
+yes_no() {   # yes_no "Question" default(y|n) -> returns 0 for yes
+  local def="$2" hint reply
+  [[ "$def" == y ]] && hint="[Y/n]" || hint="[y/N]"
+  while true; do
+    ask "$1 $hint " reply
+    reply="${reply,,}"; [[ -z "$reply" ]] && reply="$def"
+    case "$reply" in y|yes) return 0 ;; n|no) return 1 ;; *) bad "Please answer y or n." ;; esac
+  done
+}
+
+trap 'echo; warn "Cancelled (Ctrl+C)."; exit 130' INT
+
+tmp_in_ram() { [[ "$(findmnt -n -o FSTYPE /tmp 2>/dev/null)" == tmpfs ]]; }
+
+desktop_file() { echo "$APPS_DIR/brave-$1.desktop"; }
+data_dir()     { echo "$PROFILES_DIR/$1"; }
+meta()         { sed -n "s/^X-BraveProfile-$2=//p" "$(desktop_file "$1")" 2>/dev/null | head -n1; }
+
+# ---------- Brave detection ----------
+find_brave() {
+  local c
+  [[ -n "${BRAVE_BIN:-}" && -x "$BRAVE_BIN" ]] && return 0   # manual override
+  for c in /usr/bin/brave-browser /usr/bin/brave-browser-stable /opt/brave.com/brave/brave-browser; do
+    [[ -x "$c" ]] && { BRAVE_BIN="$c"; return 0; }
+  done
+  if command -v flatpak >/dev/null && flatpak info com.brave.Browser >/dev/null 2>&1; then
+    die "Only the Flatpak version of Brave is installed. This script needs the native package (RPM/DEB) from https://brave.com/linux"
+  fi
+  die "Brave isn't installed (looked in /usr/bin and /opt/brave.com). Install it from https://brave.com/linux"
+}
+
+# ---------- name ----------
+slugify() {
+  local s="${1,,}"
+  s="${s//[ _]/-}"; s="$(printf '%s' "$s" | tr -cd 'a-z0-9-' | tr -s '-')"
+  s="${s#-}"; s="${s%-}"; printf '%s' "$s"
+}
+
+ask_name() {
+  local choice
+  REUSE_DATA=0
+  while true; do
+    ask "Name your profile (e.g. University): " DISPLAY_NAME
+    DISPLAY_NAME="$(printf '%s' "$DISPLAY_NAME" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    if [[ -z "$DISPLAY_NAME" ]]; then bad "The name can't be empty."; continue; fi
+    local bad_chars='[^A-Za-z0-9 _()-]'
+    if [[ "$DISPLAY_NAME" =~ $bad_chars ]]; then
+      bad "Use only letters, numbers, spaces, dashes, underscores and brackets."; continue
+    fi
+    ID="$(slugify "$DISPLAY_NAME")"
+    if [[ -z "$ID" ]]; then bad "That name has no letters or numbers in it."; continue; fi
+
+    if [[ -e "$(desktop_file "$ID")" ]]; then
+      warn "A profile called \"$(meta "$ID" Display)\" already exists (id: $ID)."
+      ask "[r] choose a different name   [c] cancel : " choice
+      [[ "${choice,,}" == c ]] && { echo; ok "Cancelled. Nothing was changed."; exit 0; }
+      continue
+    fi
+    if [[ -d "$(data_dir "$ID")" ]]; then
+      warn "No launcher exists for \"$ID\", but its data folder from an earlier profile is still here:"
+      echo "     $(data_dir "$ID")"
+      ask "[u] use that old data (keeps its logins)   [r] different name   [c] cancel : " choice
+      case "${choice,,}" in
+        u) REUSE_DATA=1 ;;
+        c) echo; ok "Cancelled. Nothing was changed."; exit 0 ;;
+        *) continue ;;
+      esac
+    fi
+    if ((REUSE_DATA)); then ok "Re-creating \"Brave $DISPLAY_NAME\" with its old data  ${D}(id: $ID)${N}"
+    else ok "Name is available: \"Brave $DISPLAY_NAME\"  ${D}(id: $ID)${N}"; fi
+    return 0
+  done
+}
+
+# ---------- DNS ----------
+fallback_host() {   # official hostname for well-known DNS IPs
+  case "$1" in
+    1.1.1.1|1.0.0.1)         echo "cloudflare-dns.com" ;;
+    9.9.9.9|149.112.112.112) echo "dns.quad9.net" ;;
+    8.8.8.8|8.8.4.4)         echo "dns.google" ;;
+  esac
+}
+valid_ipv4() {
+  local IFS=. o; local -a p
+  [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || return 1
+  read -r -a p <<< "$1"; for o in "${p[@]}"; do ((10#$o <= 255)) || return 1; done
+}
+test_doh() {   # does this DoH address answer a real DNS question?
+  local code
+  code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 \
+          -H 'accept: application/dns-message' "$1?dns=$DOH_TEST_QUERY" 2>/dev/null)"
+  [[ "$code" == 200 ]]
+}
+
+ask_dns() {
+  DNS_TEMPLATES=""; DNS_LABEL="system (normal network DNS)"
+  yes_no "Does this profile need its own custom DNS?" n || { ok "Using normal network DNS."; return 0; }
+
+  echo "  ${D}Enter DNS server IPs separated by commas. They must support encrypted DNS (DoH),"
+  echo "  e.g. 1.1.1.1,1.0.0.1 (Cloudflare) · 9.9.9.9,149.112.112.112 (Quad9) · 8.8.8.8,8.8.4.4 (Google)."
+  echo "  You can also paste full DoH addresses like https://example.com/dns-query${N}"
+  local input entry tpl host failed choice; local -a entries templates
+  while true; do
+    ask "DNS servers: " input
+    IFS=',' read -r -a entries <<< "$input"; templates=(); failed=0
+    [[ ${#entries[@]} -gt 0 ]] || { bad "Please enter at least one server."; continue; }
+    for entry in "${entries[@]}"; do
+      entry="$(printf '%s' "$entry" | tr -d '[:space:]')"; [[ -z "$entry" ]] && continue
+      if valid_ipv4 "$entry"; then tpl="https://$entry/dns-query"
+      elif [[ "$entry" == https://* ]]; then tpl="$entry"
+      else bad "\"$entry\" isn't an IPv4 address or an https:// DoH address."; failed=1; continue; fi
+
+      printf '  … testing %s\r' "$entry"
+      if test_doh "$tpl"; then
+        ok "$entry answers encrypted DNS (DoH)                "
+        templates+=("$tpl")
+      elif host="$(fallback_host "$entry")" && [[ -n "$host" ]] && test_doh "https://$host/dns-query"; then
+        ok "$entry works via its official address https://$host/dns-query"
+        [[ " ${templates[*]} " == *" https://$host/dns-query "* ]] || templates+=("https://$host/dns-query")
+      else
+        bad "$entry did not answer encrypted DNS (DoH)        "; failed=1
+        valid_ipv4 "$entry" && echo "     ${D}Plain DNS servers (like a router's 192.168.x.x) can't be set per-browser; only DoH can.${N}"
+      fi
+    done
+
+    if ((failed == 0 && ${#templates[@]} > 0)); then
+      DNS_TEMPLATES="${templates[*]}"; DNS_LABEL="$input (strict: no fallback to network DNS)"
+      ok "Custom DNS accepted."; return 0
+    fi
+    warn "Not every server passed. (If you're offline right now, every test fails.)"
+    ask "[r] re-enter   [k] keep what I typed anyway   [n] no custom DNS   [c] cancel : " choice
+    case "${choice,,}" in
+      k) for entry in "${entries[@]}"; do entry="$(printf '%s' "$entry" | tr -d '[:space:]')"
+           valid_ipv4 "$entry" && templates+=("https://$entry/dns-query")
+           [[ "$entry" == https://* ]] && templates+=("$entry"); done
+         [[ ${#templates[@]} -gt 0 ]] || { bad "Nothing usable to keep."; continue; }
+         readarray -t templates < <(printf '%s\n' "${templates[@]}" | awk '!seen[$0]++')
+         DNS_TEMPLATES="${templates[*]}"; DNS_LABEL="$input (untested)"; warn "Kept without a successful test."; return 0 ;;
+      n) ok "Using normal network DNS."; return 0 ;;
+      c) echo; ok "Cancelled. Nothing was changed."; exit 0 ;;
+      *) continue ;;
+    esac
+  done
+}
+
+# Brave keeps Secure-DNS in "Local State", which is per data folder.
+seed_dns() {   # seed_dns <dir> "<templates>"
+  printf '{"dns_over_https":{"mode":"secure","templates":"%s"}}\n' "$2" > "$1/Local State"
+}
+
+# ---------- create ----------
+write_launcher() {
+  local file exec_main exec_new="" dir
+  file="$(desktop_file "$ID")"; dir="$(data_dir "$ID")"
+  if [[ "$MODE" == wipe ]]; then
+    exec_main="\"$SELF\" run-ephemeral $ID %U"
+  else
+    local base="\"$BRAVE_BIN\" --user-data-dir=\"$dir\" --class=brave-$ID --window-name=\"$DISPLAY_NAME\" ${COMMON_FLAGS[*]}"
+    exec_main="$base %U"; exec_new="$base --new-window"
+  fi
+  {
+    echo "[Desktop Entry]"
+    echo "Version=1.0"
+    echo "Type=Application"
+    echo "Name=Brave $DISPLAY_NAME"
+    echo "Comment=Isolated Brave profile"
+    echo "Exec=$exec_main"
+    echo "Icon=brave-browser"
+    echo "Terminal=false"
+    echo "Categories=Network;WebBrowser;"
+    echo "Keywords=brave;browser;$ID;"
+    echo "StartupNotify=true"
+    echo "StartupWMClass=brave-$ID"
+    echo "X-BraveProfile-Id=$ID"
+    echo "X-BraveProfile-Display=$DISPLAY_NAME"
+    echo "X-BraveProfile-Mode=$MODE"
+    echo "X-BraveProfile-DNS=$DNS_TEMPLATES"
+    if [[ -n "$exec_new" ]]; then
+      echo "Actions=new-window;"; echo
+      echo "[Desktop Action new-window]"; echo "Name=New Window"; echo "Exec=$exec_new"
+    fi
+  } > "$file"
+}
+
+cmd_create() {
+  printf '%sCreate a new isolated Brave profile%s  %s(Ctrl+C cancels at any time)%s\n' "$B" "$N" "$D" "$N"
+  step "Checking Brave"
+  find_brave; ok "Brave found: $BRAVE_BIN  ${D}($("$BRAVE_BIN" --version 2>/dev/null | head -n1))${N}"
+  command -v curl >/dev/null || warn "curl is missing, so DNS servers can't be tested (sudo dnf install curl)."
+
+  step "1/3  Profile name";  ask_name
+  step "2/3  Profile type"
+  echo "  ${D}Normal = keeps your logins.  Wipe-on-close = like Private, nothing is kept.${N}"
+  if ((REUSE_DATA == 0)) && yes_no "Wipe everything when this profile closes?" n; then
+    MODE=wipe; ok "Type: wipe-on-close (fresh every launch$(tmp_in_ram && echo ', lives in RAM'))"
+  else MODE=normal; ok "Type: normal (keeps logins)"; fi
+  step "3/3  DNS";           ask_dns
+
+  step "Summary"
+  echo "  Launcher name : Brave $DISPLAY_NAME"
+  echo "  Profile id    : $ID"
+  echo "  Type          : $MODE"
+  echo "  DNS           : $DNS_LABEL"
+  [[ "$MODE" == normal ]] && echo "  Data folder   : $(data_dir "$ID")$( ((REUSE_DATA)) && echo '  (existing, reused)')"
+  echo
+  yes_no "Create this profile?" y || { ok "Cancelled. Nothing was changed."; exit 0; }
+
+  local dir; dir="$(data_dir "$ID")"
+  step "Creating"
+  if [[ "$MODE" == normal ]]; then
+    if mkdir -p "$dir" && chmod 700 "$PROFILES_DIR" "$dir"; then ok "Data folder ready (private to you): $dir"
+    else die "Could not create $dir"; fi
+  else
+    ok "No data folder needed: a fresh one is made in /tmp at each launch and deleted on close."
+  fi
+
+  if [[ -n "$DNS_TEMPLATES" ]]; then
+    if [[ "$MODE" == wipe ]]; then ok "Custom DNS saved; it is applied automatically at every launch."
+    elif [[ -e "$dir/Local State" ]]; then
+      warn "This profile has been used before, so DNS can't be pre-set safely."
+      warn "Set it inside the profile: brave://settings/security → Use secure DNS."
+    elif seed_dns "$dir" "$DNS_TEMPLATES" && grep -q '"secure"' "$dir/Local State"; then
+      ok "Custom DNS configured (strict mode) for this profile only."
+    else die "Could not write the DNS setting."; fi
+  fi
+
+  mkdir -p "$APPS_DIR"
+  if write_launcher; then ok "Launcher created: $(desktop_file "$ID")"; else die "Could not write the launcher."; fi
+  if command -v desktop-file-validate >/dev/null; then
+    if desktop-file-validate "$(desktop_file "$ID")"; then ok "Launcher checked: valid"
+    else warn "Launcher has warnings (shown above) but should still work."; fi
+  fi
+
+  step "Syncing the applications menu"
+  if command -v update-desktop-database >/dev/null && update-desktop-database "$APPS_DIR" 2>/dev/null; then
+    ok "Applications menu refreshed."
+  else warn "Couldn't refresh the menu automatically; if it doesn't show up, log out and back in."; fi
+
+  echo
+  ok "${G}Done!${N} Press the Super key and type \"$DISPLAY_NAME\" to find \"Brave $DISPLAY_NAME\"."
+  [[ -n "$DNS_TEMPLATES" ]] && echo "     ${D}Check the DNS: open the profile and visit https://one.one.one.one/help${N}"
+  echo
+  if yes_no "Open it now?" n; then
+    if [[ "$MODE" == wipe ]]; then setsid "$SELF" run-ephemeral "$ID" >/dev/null 2>&1 &
+    else setsid "$BRAVE_BIN" --user-data-dir="$dir" --class="brave-$ID" --window-name="$DISPLAY_NAME" \
+           "${COMMON_FLAGS[@]}" >/dev/null 2>&1 &
+    fi
+    ok "Launched."
+  fi
+}
+
+# ---------- wipe-on-close launcher (called by the .desktop file) ----------
+cmd_run_ephemeral() {
+  local id="${1:-}"; [[ -n "$id" ]] || exit 1; shift
+  find_brave >/dev/null
+  local dns; dns="$(meta "$id" DNS)"
+  EPHEMERAL_DIR="$(mktemp -d "/tmp/brave-$id.XXXXXX")"   # /tmp is RAM-backed on Fedora and many distros
+  trap 'rm -rf -- "$EPHEMERAL_DIR"' EXIT INT TERM HUP
+  [[ -n "$dns" ]] && seed_dns "$EPHEMERAL_DIR" "$dns"
+  "$BRAVE_BIN" --user-data-dir="$EPHEMERAL_DIR" --class="brave-$id" \
+    --window-name="$(meta "$id" Display)" "${COMMON_FLAGS[@]}" \
+    --disk-cache-size="$EPHEMERAL_CACHE_LIMIT" "$@"
+}
+
+# ---------- list / remove ----------
+is_running() {
+  local lock="$1/SingletonLock" target
+  [[ -L "$lock" ]] || return 1
+  target="$(readlink "$lock")"; kill -0 "${target##*-}" 2>/dev/null
+}
+
+cmd_list() {
+  shopt -s nullglob
+  local files=("$APPS_DIR"/brave-*.desktop) f id mode dns dir size state
+  printf '%-28s %-22s %-7s %-8s %-8s %s\n' "LAUNCHER" "ID" "TYPE" "SIZE" "STATE" "DNS"
+  local personal="$HOME/.config/BraveSoftware/Brave-Browser"
+  size="-"; [[ -d "$personal" ]] && size="$(du -sh "$personal" 2>/dev/null | cut -f1)"
+  printf '%-28s %-22s %-7s %-8s %-8s %s\n' "Brave (Personal)" "(default Brave)" "normal" "$size" "-" "system"
+  for f in "${files[@]}"; do
+    id="$(sed -n 's/^X-BraveProfile-Id=//p' "$f")"; [[ -n "$id" ]] || continue
+    mode="$(meta "$id" Mode)"; dns="$(meta "$id" DNS)"; dir="$(data_dir "$id")"; size="-"; state="-"
+    if [[ "$mode" == normal && -d "$dir" ]]; then
+      size="$(du -sh "$dir" 2>/dev/null | cut -f1)"
+      is_running "$dir" && state="running" || state="closed"
+    fi
+    printf '%-28s %-22s %-7s %-8s %-8s %s\n' "Brave $(meta "$id" Display)" "$id" "$mode" "$size" "$state" \
+      "${dns:+custom: }${dns:-system}"
+  done
+}
+
+cmd_remove() {
+  cmd_list; echo
+  local id confirm dir
+  ask "Type the ID of the profile to remove (or press Enter to cancel): " id
+  [[ -z "$id" ]] && { ok "Cancelled. Nothing was changed."; exit 0; }
+  [[ -e "$(desktop_file "$id")" ]] || die "No profile with ID \"$id\"."
+  dir="$(data_dir "$id")"
+  is_running "$dir" && die "\"$id\" is open right now. Close all its windows first."
+  rm -f -- "$(desktop_file "$id")" && ok "Launcher removed."
+  if [[ -d "$dir" ]]; then
+    if yes_no "Also permanently delete its data (logins, history, everything)?" n; then
+      ask "Type \"$id\" to confirm: " confirm
+      if [[ "$confirm" == "$id" ]]; then rm -rf -- "$dir" && ok "Data deleted."
+      else warn "Didn't match; data kept at $dir"; fi
+    else ok "Data kept at $dir (creating a profile with the same name later can reuse it)."; fi
+  fi
+  update-desktop-database "$APPS_DIR" 2>/dev/null && ok "Applications menu refreshed."
+}
+
+case "${1:-}" in
+  "")            cmd_create ;;
+  list|ls)       cmd_list ;;
+  remove|rm)     cmd_remove ;;
+  run-ephemeral) shift; cmd_run_ephemeral "$@" ;;
+  -h|--help|help) sed -n '2,10p' "$SELF" | sed 's/^# \{0,1\}//' ;;
+  *) die "Unknown command \"$1\". Try: brave-profile --help" ;;
+esac
